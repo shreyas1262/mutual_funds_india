@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 import logging
 import tempfile
 import os
+import pandas as pd
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1168,4 +1169,898 @@ class AMFICollector:
             
         except Exception as e:
             logger.error(f"Error during duplicate scheme analysis: {e}")
+            return {'status': 'error', 'message': str(e)}
+        
+    def get_scheme_performance(self, scheme_code: str, periods: List[int] = [30, 90, 180, 365]) -> Dict:
+        """
+        Calculate performance metrics for a specific scheme over various time periods.
+        
+        Args:
+            scheme_code: The scheme code to analyze
+            periods: List of periods in days to calculate returns for
+            
+        Returns:
+            Dictionary with performance metrics including returns, volatility, and statistics
+        """
+        try:
+            logger.info(f"Calculating performance for scheme {scheme_code}")
+            
+            # Get historical NAV data for the scheme
+            nav_data = self.read_from_delta(self.nav_data_path)
+            if nav_data is None or nav_data.isEmpty():
+                return {'status': 'failed', 'reason': 'No NAV data available'}
+            
+            # Filter for specific scheme and sort by date
+            scheme_data = nav_data.filter(f.col("scheme_code") == scheme_code).orderBy("date")
+            
+            if scheme_data.isEmpty():
+                return {'status': 'failed', 'reason': f'No data found for scheme code {scheme_code}'}
+            
+            # Convert to pandas for easier calculations (collect small dataset)
+            nav_df = scheme_data.select("date", "nav", "scheme_name").toPandas()
+            nav_df['date'] = pd.to_datetime(nav_df['date'])
+            nav_df = nav_df.sort_values('date')
+            
+            if len(nav_df) < 2:
+                return {'status': 'failed', 'reason': 'Insufficient data for performance calculation'}
+            
+            # Calculate daily returns
+            nav_df['daily_return'] = nav_df['nav'].pct_change()
+            
+            current_nav = nav_df.iloc[-1]['nav']
+            current_date = nav_df.iloc[-1]['date']
+            scheme_name = nav_df.iloc[0]['scheme_name']
+            
+            performance_metrics = {
+                'scheme_code': scheme_code,
+                'scheme_name': scheme_name,
+                'current_nav': round(current_nav, 4),
+                'current_date': current_date.strftime('%Y-%m-%d'),
+                'data_points': len(nav_df),
+                'period_returns': {},
+                'volatility_metrics': {}
+            }
+            
+            # Calculate returns for each period
+            for period in periods:
+                try:
+                    if len(nav_df) <= period:
+                        # Use all available data if period is longer than data
+                        start_nav = nav_df.iloc[0]['nav']
+                        start_date = nav_df.iloc[0]['date']
+                        days_actual = len(nav_df) - 1
+                    else:
+                        start_nav = nav_df.iloc[-period-1]['nav']
+                        start_date = nav_df.iloc[-period-1]['date']
+                        days_actual = period
+                    
+                    # Calculate absolute and percentage returns
+                    abs_return = current_nav - start_nav
+                    pct_return = ((current_nav - start_nav) / start_nav) * 100
+                    
+                    # Annualized return
+                    annualized_return = ((current_nav / start_nav) ** (365.25 / days_actual) - 1) * 100
+                    
+                    performance_metrics['period_returns'][f'{period}d'] = {
+                        'absolute_return': round(abs_return, 4),
+                        'percentage_return': round(pct_return, 2),
+                        'annualized_return': round(annualized_return, 2),
+                        'start_date': start_date.strftime('%Y-%m-%d'),
+                        'start_nav': round(start_nav, 4),
+                        'days_actual': days_actual
+                    }
+                    
+                except Exception as period_error:
+                    performance_metrics['period_returns'][f'{period}d'] = {
+                        'error': str(period_error)
+                    }
+            
+            # Calculate volatility metrics (using available data)
+            if len(nav_df) > 1:
+                daily_returns = nav_df['daily_return'].dropna()
+                
+                if len(daily_returns) > 0:
+                    volatility_daily = daily_returns.std()
+                    volatility_annualized = volatility_daily * (252 ** 0.5)  # 252 trading days
+                    
+                    performance_metrics['volatility_metrics'] = {
+                        'daily_volatility': round(volatility_daily, 6),
+                        'annualized_volatility': round(volatility_annualized, 4),
+                        'max_daily_gain': round(daily_returns.max() * 100, 2),
+                        'max_daily_loss': round(daily_returns.min() * 100, 2),
+                        'positive_days': int((daily_returns > 0).sum()),
+                        'negative_days': int((daily_returns < 0).sum()),
+                        'win_rate': round(((daily_returns > 0).sum() / len(daily_returns)) * 100, 1)
+                    }
+            
+            logger.info(f"Performance calculation completed for scheme {scheme_code}")
+            return performance_metrics
+            
+        except Exception as e:
+            logger.error(f"Error calculating performance for scheme {scheme_code}: {e}")
+            return {'status': 'error', 'message': str(e)}
+            
+    def compare_schemes(self, scheme_codes: List[str], comparison_period: int = 365) -> Dict:
+        """
+        Compare performance of multiple schemes side by side.
+        
+        Args:
+            scheme_codes: List of scheme codes to compare
+            comparison_period: Number of days to look back for comparison
+            
+        Returns:
+            Dictionary with comparative analysis of the schemes
+        """
+        try:
+            logger.info(f"Comparing {len(scheme_codes)} schemes over {comparison_period} days")
+            
+            if len(scheme_codes) < 2:
+                return {'status': 'failed', 'reason': 'Need at least 2 schemes to compare'}
+            
+            if len(scheme_codes) > 10:
+                return {'status': 'failed', 'reason': 'Maximum 10 schemes allowed for comparison'}
+            
+            # Get NAV data
+            nav_data = self.read_from_delta(self.nav_data_path)
+            if nav_data is None or nav_data.isEmpty():
+                return {'status': 'failed', 'reason': 'No NAV data available'}
+            
+            comparison_results = {
+                'comparison_period_days': comparison_period,
+                'schemes_compared': len(scheme_codes),
+                'scheme_performance': {},
+                'comparative_metrics': {},
+                'rankings': {}
+            }
+            
+            scheme_performances = []
+            
+            # Get performance for each scheme
+            for scheme_code in scheme_codes:
+                try:
+                    # Get performance using our existing method
+                    perf = self.get_scheme_performance(scheme_code, [comparison_period])
+                    
+                    if perf.get('status') == 'error':
+                        comparison_results['scheme_performance'][scheme_code] = {
+                            'status': 'failed',
+                            'reason': perf.get('message', 'Unknown error')
+                        }
+                        continue
+                    
+                    # Extract key metrics for comparison
+                    period_key = f'{comparison_period}d'
+                    if period_key in perf.get('period_returns', {}):
+                        scheme_data = {
+                            'scheme_code': scheme_code,
+                            'scheme_name': perf.get('scheme_name', 'Unknown'),
+                            'current_nav': perf.get('current_nav', 0),
+                            'absolute_return': perf['period_returns'][period_key].get('absolute_return', 0),
+                            'percentage_return': perf['period_returns'][period_key].get('percentage_return', 0),
+                            'annualized_return': perf['period_returns'][period_key].get('annualized_return', 0),
+                            'volatility': perf.get('volatility_metrics', {}).get('annualized_volatility', 0),
+                            'win_rate': perf.get('volatility_metrics', {}).get('win_rate', 0),
+                            'data_points': perf.get('data_points', 0)
+                        }
+                        
+                        scheme_performances.append(scheme_data)
+                        comparison_results['scheme_performance'][scheme_code] = scheme_data
+                    else:
+                        comparison_results['scheme_performance'][scheme_code] = {
+                            'status': 'failed',
+                            'reason': f'No data available for {comparison_period} day period'
+                        }
+                        
+                except Exception as scheme_error:
+                    comparison_results['scheme_performance'][scheme_code] = {
+                        'status': 'failed',
+                        'reason': str(scheme_error)
+                    }
+            
+            # If we have valid performance data for multiple schemes, calculate comparative metrics
+            if len(scheme_performances) >= 2:
+                
+                # Calculate comparative statistics
+                returns = [s['percentage_return'] for s in scheme_performances]
+                volatilities = [s['volatility'] for s in scheme_performances]
+                
+                comparison_results['comparative_metrics'] = {
+                    'return_statistics': {
+                        'highest_return': max(returns),
+                        'lowest_return': min(returns),
+                        'average_return': round(sum(returns) / len(returns), 2),
+                        'return_spread': round(max(returns) - min(returns), 2)
+                    },
+                    'risk_statistics': {
+                        'highest_volatility': max(volatilities),
+                        'lowest_volatility': min(volatilities),
+                        'average_volatility': round(sum(volatilities) / len(volatilities), 4)
+                    }
+                }
+                
+                # Calculate risk-adjusted returns (simplified Sharpe-like ratio)
+                for scheme in scheme_performances:
+                    if scheme['volatility'] > 0:
+                        scheme['risk_adjusted_return'] = round(scheme['percentage_return'] / scheme['volatility'], 2)
+                    else:
+                        scheme['risk_adjusted_return'] = 0
+                
+                # Create rankings
+                comparison_results['rankings'] = {
+                    'by_return': sorted(scheme_performances, key=lambda x: x['percentage_return'], reverse=True),
+                    'by_volatility': sorted(scheme_performances, key=lambda x: x['volatility']),  # Lower is better
+                    'by_risk_adjusted': sorted(scheme_performances, key=lambda x: x['risk_adjusted_return'], reverse=True)
+                }
+                
+                # Add ranking positions
+                for i, scheme in enumerate(comparison_results['rankings']['by_return']):
+                    scheme['return_rank'] = i + 1
+                
+                for i, scheme in enumerate(comparison_results['rankings']['by_volatility']):
+                    scheme['risk_rank'] = i + 1
+                
+                for i, scheme in enumerate(comparison_results['rankings']['by_risk_adjusted']):
+                    scheme['risk_adjusted_rank'] = i + 1
+                
+                # Best/Worst performers
+                comparison_results['summary'] = {
+                    'best_performer': comparison_results['rankings']['by_return'][0]['scheme_code'],
+                    'worst_performer': comparison_results['rankings']['by_return'][-1]['scheme_code'],
+                    'least_risky': comparison_results['rankings']['by_volatility'][0]['scheme_code'],
+                    'most_risky': comparison_results['rankings']['by_volatility'][-1]['scheme_code'],
+                    'best_risk_adjusted': comparison_results['rankings']['by_risk_adjusted'][0]['scheme_code']
+                }
+            
+            logger.info(f"Scheme comparison completed for {len(scheme_codes)} schemes")
+            return comparison_results
+            
+        except Exception as e:
+            logger.error(f"Error comparing schemes: {e}")
+            return {'status': 'error', 'message': str(e)}
+        
+    def get_top_performers(self, category: str = None, period: int = 365, limit: int = 10, 
+                          sort_by: str = "return") -> Dict:
+        """
+        Get top performing schemes based on various criteria.
+        
+        Args:
+            category: Scheme category filter (e.g., 'Equity', 'Debt') or None for all
+            period: Performance period in days
+            limit: Number of top performers to return
+            sort_by: Sort criteria ('return', 'volatility', 'risk_adjusted')
+            
+        Returns:
+            Dictionary with top performing schemes and analysis
+        """
+        try:
+            logger.info(f"Finding top {limit} performers for period {period} days, category: {category or 'all'}")
+            
+            # Get scheme list to analyze
+            if category:
+                schemes_df = self.get_schemes_by_category(category)
+            else:
+                # Get all schemes from scheme master or daily data
+                scheme_master = self.read_from_delta(self.scheme_master_path)
+                if scheme_master is not None:
+                    schemes_df = scheme_master
+                else:
+                    daily_nav = self.get_daily_nav_data()
+                    if daily_nav is None or daily_nav.isEmpty():
+                        return {'status': 'failed', 'reason': 'No scheme data available'}
+                    schemes_df = daily_nav.select("scheme_code", "scheme_name", "fund_house").distinct()
+            
+            if schemes_df.isEmpty():
+                return {'status': 'failed', 'reason': f'No schemes found for category: {category}'}
+            
+            # Get list of scheme codes to analyze (limit initial set for performance)
+            scheme_list = [row['scheme_code'] for row in schemes_df.limit(100).collect()]
+            
+            logger.info(f"Analyzing performance for {len(scheme_list)} schemes...")
+            
+            # Calculate performance for each scheme
+            scheme_performances = []
+            processed_count = 0
+            
+            for scheme_code in scheme_list:
+                try:
+                    # Get performance metrics
+                    perf = self.get_scheme_performance(scheme_code, [period])
+                    
+                    if perf.get('status') in ['error', 'failed']:
+                        continue
+                    
+                    period_key = f'{period}d'
+                    if period_key in perf.get('period_returns', {}):
+                        period_data = perf['period_returns'][period_key]
+                        volatility_data = perf.get('volatility_metrics', {})
+                        
+                        # Calculate risk-adjusted return
+                        vol = volatility_data.get('annualized_volatility', 0)
+                        risk_adjusted = period_data.get('percentage_return', 0) / vol if vol > 0 else 0
+                        
+                        scheme_perf = {
+                            'scheme_code': scheme_code,
+                            'scheme_name': perf.get('scheme_name', 'Unknown'),
+                            'current_nav': perf.get('current_nav', 0),
+                            'percentage_return': period_data.get('percentage_return', 0),
+                            'annualized_return': period_data.get('annualized_return', 0),
+                            'volatility': vol,
+                            'risk_adjusted_return': round(risk_adjusted, 2),
+                            'win_rate': volatility_data.get('win_rate', 0),
+                            'max_daily_gain': volatility_data.get('max_daily_gain', 0),
+                            'data_points': perf.get('data_points', 0)
+                        }
+                        
+                        scheme_performances.append(scheme_perf)
+                        processed_count += 1
+                        
+                        # Progress logging
+                        if processed_count % 20 == 0:
+                            logger.info(f"Processed {processed_count} schemes...")
+                    
+                except Exception as scheme_error:
+                    logger.debug(f"Skipped scheme {scheme_code}: {scheme_error}")
+                    continue
+            
+            if not scheme_performances:
+                return {'status': 'failed', 'reason': 'No valid performance data found'}
+            
+            logger.info(f"Performance analysis completed for {len(scheme_performances)} schemes")
+            
+            # Sort based on criteria
+            if sort_by == "return":
+                sorted_schemes = sorted(scheme_performances, key=lambda x: x['percentage_return'], reverse=True)
+            elif sort_by == "volatility":
+                sorted_schemes = sorted(scheme_performances, key=lambda x: x['volatility'])  # Lower volatility is better
+            elif sort_by == "risk_adjusted":
+                sorted_schemes = sorted(scheme_performances, key=lambda x: x['risk_adjusted_return'], reverse=True)
+            else:
+                return {'status': 'failed', 'reason': f'Invalid sort_by criteria: {sort_by}'}
+            
+            # Get top performers
+            top_performers = sorted_schemes[:limit]
+            
+            # Calculate summary statistics
+            all_returns = [s['percentage_return'] for s in scheme_performances]
+            all_volatilities = [s['volatility'] for s in scheme_performances if s['volatility'] > 0]
+            
+            summary_stats = {
+                'total_schemes_analyzed': len(scheme_performances),
+                'period_days': period,
+                'category_filter': category or 'all',
+                'sort_criteria': sort_by,
+                'return_statistics': {
+                    'average_return': round(sum(all_returns) / len(all_returns), 2) if all_returns else 0,
+                    'median_return': round(sorted(all_returns)[len(all_returns)//2], 2) if all_returns else 0,
+                    'top_return': max(all_returns) if all_returns else 0,
+                    'bottom_return': min(all_returns) if all_returns else 0
+                },
+                'volatility_statistics': {
+                    'average_volatility': round(sum(all_volatilities) / len(all_volatilities), 4) if all_volatilities else 0,
+                    'lowest_volatility': min(all_volatilities) if all_volatilities else 0,
+                    'highest_volatility': max(all_volatilities) if all_volatilities else 0
+                }
+            }
+            
+            results = {
+                'top_performers': top_performers,
+                'summary_statistics': summary_stats,
+                'analysis_metadata': {
+                    'analysis_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'performance_period': f'{period} days',
+                    'ranking_criteria': sort_by
+                }
+            }
+            
+            logger.info(f"Top performers analysis completed. Found {len(top_performers)} top performers")
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error finding top performers: {e}")
+            return {'status': 'error', 'message': str(e)}
+        
+
+    def calculate_volatility(self, scheme_code: str, window_days: int = 252) -> Dict:
+        """
+        Calculate comprehensive volatility metrics for a scheme.
+        
+        Args:
+            scheme_code: The scheme code to analyze
+            window_days: Rolling window for volatility calculation (default: 252 trading days)
+            
+        Returns:
+            Dictionary with various volatility measures and risk metrics
+        """
+        try:
+            logger.info(f"Calculating volatility metrics for scheme {scheme_code}")
+            
+            # Get historical NAV data
+            nav_data = self.read_from_delta(self.nav_data_path)
+            if nav_data is None or nav_data.isEmpty():
+                return {'status': 'failed', 'reason': 'No NAV data available'}
+            
+            # Filter for specific scheme and sort by date
+            scheme_data = nav_data.filter(f.col("scheme_code") == scheme_code).orderBy("date")
+            
+            if scheme_data.isEmpty():
+                return {'status': 'failed', 'reason': f'No data found for scheme code {scheme_code}'}
+            
+            # Convert to pandas for time series analysis
+            nav_df = scheme_data.select("date", "nav", "scheme_name").toPandas()
+            nav_df['date'] = pd.to_datetime(nav_df['date'])
+            nav_df = nav_df.sort_values('date').reset_index(drop=True)
+            
+            if len(nav_df) < 30:
+                return {'status': 'failed', 'reason': 'Insufficient data for volatility calculation (minimum 30 days required)'}
+            
+            # Calculate daily returns
+            nav_df['daily_return'] = nav_df['nav'].pct_change()
+            nav_df = nav_df.dropna()
+            
+            if len(nav_df) < 20:
+                return {'status': 'failed', 'reason': 'Insufficient returns data for volatility calculation'}
+            
+            scheme_name = nav_df.iloc[0]['scheme_name'] if 'scheme_name' in nav_df.columns else 'Unknown'
+            
+            volatility_metrics = {
+                'scheme_code': scheme_code,
+                'scheme_name': scheme_name,
+                'analysis_period': {
+                    'start_date': nav_df['date'].min().strftime('%Y-%m-%d'),
+                    'end_date': nav_df['date'].max().strftime('%Y-%m-%d'),
+                    'total_days': len(nav_df),
+                    'window_days': window_days
+                }
+            }
+            
+            daily_returns = nav_df['daily_return']
+            
+            # Basic volatility metrics
+            daily_vol = daily_returns.std()
+            annualized_vol = daily_vol * (252 ** 0.5)  # 252 trading days per year
+            
+            volatility_metrics['basic_volatility'] = {
+                'daily_volatility': round(daily_vol, 6),
+                'weekly_volatility': round(daily_vol * (5 ** 0.5), 6),
+                'monthly_volatility': round(daily_vol * (21 ** 0.5), 5),
+                'annualized_volatility': round(annualized_vol, 4)
+            }
+            
+            # Rolling volatility (if we have enough data)
+            if len(nav_df) >= window_days:
+                rolling_vol = nav_df['daily_return'].rolling(window=window_days).std() * (252 ** 0.5)
+                rolling_vol_clean = rolling_vol.dropna()
+                
+                if len(rolling_vol_clean) > 0:
+                    volatility_metrics['rolling_volatility'] = {
+                        'current_rolling_vol': round(rolling_vol_clean.iloc[-1], 4),
+                        'average_rolling_vol': round(rolling_vol_clean.mean(), 4),
+                        'min_rolling_vol': round(rolling_vol_clean.min(), 4),
+                        'max_rolling_vol': round(rolling_vol_clean.max(), 4),
+                        'volatility_of_volatility': round(rolling_vol_clean.std(), 4)
+                    }
+            
+            # Downside volatility (volatility of negative returns only)
+            negative_returns = daily_returns[daily_returns < 0]
+            if len(negative_returns) > 0:
+                downside_vol = negative_returns.std() * (252 ** 0.5)
+                volatility_metrics['downside_risk'] = {
+                    'downside_volatility': round(downside_vol, 4),
+                    'downside_frequency': round(len(negative_returns) / len(daily_returns), 3),
+                    'average_down_day': round(negative_returns.mean() * 100, 2),
+                    'worst_single_day': round(negative_returns.min() * 100, 2)
+                }
+            
+            # Upside volatility
+            positive_returns = daily_returns[daily_returns > 0]
+            if len(positive_returns) > 0:
+                upside_vol = positive_returns.std() * (252 ** 0.5)
+                volatility_metrics['upside_potential'] = {
+                    'upside_volatility': round(upside_vol, 4),
+                    'upside_frequency': round(len(positive_returns) / len(daily_returns), 3),
+                    'average_up_day': round(positive_returns.mean() * 100, 2),
+                    'best_single_day': round(positive_returns.max() * 100, 2)
+                }
+            
+            # Risk metrics
+            mean_return = daily_returns.mean()
+            skewness = daily_returns.skew()
+            kurtosis = daily_returns.kurtosis()
+            
+            volatility_metrics['risk_statistics'] = {
+                'mean_daily_return': round(mean_return * 100, 3),
+                'return_skewness': round(skewness, 3),
+                'return_kurtosis': round(kurtosis, 3),
+                'sharpe_ratio_approx': round(mean_return / daily_vol, 3) if daily_vol > 0 else 0,
+                'coefficient_of_variation': round(daily_vol / abs(mean_return), 2) if mean_return != 0 else float('inf')
+            }
+            
+            # Value at Risk (VaR) - 95% and 99% confidence levels
+            var_95 = daily_returns.quantile(0.05) * 100  # 5th percentile (95% VaR)
+            var_99 = daily_returns.quantile(0.01) * 100  # 1st percentile (99% VaR)
+            
+            volatility_metrics['value_at_risk'] = {
+                'var_95_percent': round(var_95, 2),
+                'var_99_percent': round(var_99, 2),
+                'expected_shortfall_95': round(daily_returns[daily_returns <= daily_returns.quantile(0.05)].mean() * 100, 2),
+                'max_drawdown_single_day': round(daily_returns.min() * 100, 2)
+            }
+            
+            # Volatility regime classification
+            if annualized_vol < 0.10:
+                regime = "Low Volatility"
+            elif annualized_vol < 0.20:
+                regime = "Moderate Volatility"
+            elif annualized_vol < 0.35:
+                regime = "High Volatility"
+            else:
+                regime = "Very High Volatility"
+            
+            volatility_metrics['volatility_assessment'] = {
+                'regime': regime,
+                'risk_level': 'Low' if annualized_vol < 0.15 else 'Medium' if annualized_vol < 0.25 else 'High',
+                'interpretation': f"This scheme has {regime.lower()} with annualized volatility of {round(annualized_vol*100, 1)}%"
+            }
+            
+            logger.info(f"Volatility analysis completed for scheme {scheme_code}")
+            return volatility_metrics
+            
+        except Exception as e:
+            logger.error(f"Error calculating volatility for scheme {scheme_code}: {e}")
+            return {'status': 'error', 'message': str(e)}
+        
+    def detect_anomalies(self, scheme_code: str = None, threshold_std: float = 3.0, 
+                        min_data_points: int = 50) -> Dict:
+        """
+        Detect anomalous NAV movements and potential data quality issues.
+        
+        Args:
+            scheme_code: Specific scheme to analyze (None for all schemes)
+            threshold_std: Number of standard deviations to consider as anomaly
+            min_data_points: Minimum data points required for analysis
+            
+        Returns:
+            Dictionary with detected anomalies and analysis
+        """
+        try:
+            if scheme_code:
+                logger.info(f"Detecting anomalies for scheme {scheme_code}")
+            else:
+                logger.info("Detecting anomalies across all schemes")
+            
+            # Get NAV data
+            nav_data = self.read_from_delta(self.nav_data_path)
+            if nav_data is None or nav_data.isEmpty():
+                return {'status': 'failed', 'reason': 'No NAV data available'}
+            
+            # Filter by scheme if specified
+            if scheme_code:
+                nav_data = nav_data.filter(f.col("scheme_code") == scheme_code)
+                if nav_data.isEmpty():
+                    return {'status': 'failed', 'reason': f'No data found for scheme {scheme_code}'}
+            
+            anomaly_results = {
+                'analysis_parameters': {
+                    'scheme_code': scheme_code or 'all',
+                    'threshold_std_deviations': threshold_std,
+                    'minimum_data_points': min_data_points
+                },
+                'anomalies_detected': {
+                    'extreme_returns': [],
+                    'nav_jumps': [],
+                    'suspicious_patterns': [],
+                    'data_quality_issues': []
+                },
+                'summary_statistics': {}
+            }
+            
+            # Convert to pandas for easier analysis (limit to reasonable size)
+            if scheme_code:
+                # Single scheme - get all data
+                analysis_df = nav_data.select("date", "nav", "scheme_code", "scheme_name").toPandas()
+            else:
+                # Multiple schemes - sample for performance
+                sample_schemes = nav_data.select("scheme_code").distinct().limit(20).collect()
+                scheme_codes = [row['scheme_code'] for row in sample_schemes]
+                nav_data_filtered = nav_data.filter(f.col("scheme_code").isin(scheme_codes))
+                analysis_df = nav_data_filtered.select("date", "nav", "scheme_code", "scheme_name").toPandas()
+            
+            if len(analysis_df) < min_data_points:
+                return {'status': 'failed', 'reason': f'Insufficient data points: {len(analysis_df)} < {min_data_points}'}
+            
+            analysis_df['date'] = pd.to_datetime(analysis_df['date'])
+            analysis_df = analysis_df.sort_values(['scheme_code', 'date'])
+            
+            # Calculate daily returns for each scheme
+            analysis_df['daily_return'] = analysis_df.groupby('scheme_code')['nav'].pct_change()
+            analysis_df = analysis_df.dropna()
+            
+            if len(analysis_df) == 0:
+                return {'status': 'failed', 'reason': 'No valid return data after processing'}
+            
+            # 1. Detect extreme returns (statistical outliers)
+            returns_stats = analysis_df['daily_return'].describe()
+            mean_return = returns_stats['mean']
+            std_return = returns_stats['std']
+            
+            # Find extreme returns
+            extreme_threshold = threshold_std * std_return
+            extreme_returns = analysis_df[
+                (analysis_df['daily_return'] > mean_return + extreme_threshold) |
+                (analysis_df['daily_return'] < mean_return - extreme_threshold)
+            ].copy()
+            
+            for _, row in extreme_returns.iterrows():
+                anomaly_results['anomalies_detected']['extreme_returns'].append({
+                    'scheme_code': row['scheme_code'],
+                    'scheme_name': row['scheme_name'],
+                    'date': row['date'].strftime('%Y-%m-%d'),
+                    'nav': round(row['nav'], 4),
+                    'daily_return': round(row['daily_return'] * 100, 2),
+                    'std_deviations': round(abs(row['daily_return'] - mean_return) / std_return, 2),
+                    'anomaly_type': 'extreme_positive' if row['daily_return'] > 0 else 'extreme_negative'
+                })
+            
+            # 2. Detect NAV jumps (large changes that might be errors)
+            analysis_df['nav_change'] = analysis_df.groupby('scheme_code')['nav'].diff()
+            analysis_df['nav_change_pct'] = analysis_df['nav_change'] / analysis_df['nav'].shift(1)
+            
+            # Find unusually large NAV jumps (more than 20% in a day)
+            large_jumps = analysis_df[abs(analysis_df['nav_change_pct']) > 0.20].copy()
+            
+            for _, row in large_jumps.iterrows():
+                anomaly_results['anomalies_detected']['nav_jumps'].append({
+                    'scheme_code': row['scheme_code'],
+                    'scheme_name': row['scheme_name'],
+                    'date': row['date'].strftime('%Y-%m-%d'),
+                    'nav_before': round(row['nav'] - row['nav_change'], 4),
+                    'nav_after': round(row['nav'], 4),
+                    'nav_change': round(row['nav_change'], 4),
+                    'nav_change_percent': round(row['nav_change_pct'] * 100, 2),
+                    'possible_data_error': abs(row['nav_change_pct']) > 0.50  # Flag very large jumps
+                })
+            
+            # 3. Detect suspicious patterns
+            # Find schemes with too many consecutive identical NAVs
+            for scheme in analysis_df['scheme_code'].unique():
+                scheme_data = analysis_df[analysis_df['scheme_code'] == scheme].copy()
+                scheme_data = scheme_data.sort_values('date')
+                
+                # Check for consecutive identical NAVs (potential stale data)
+                scheme_data['nav_unchanged'] = scheme_data['nav'] == scheme_data['nav'].shift(1)
+                consecutive_unchanged = 0
+                max_consecutive = 0
+                
+                for unchanged in scheme_data['nav_unchanged']:
+                    if unchanged:
+                        consecutive_unchanged += 1
+                        max_consecutive = max(max_consecutive, consecutive_unchanged)
+                    else:
+                        consecutive_unchanged = 0
+                
+                if max_consecutive >= 5:  # 5+ consecutive days of same NAV
+                    scheme_name = scheme_data['scheme_name'].iloc[0] if not scheme_data.empty else 'Unknown'
+                    anomaly_results['anomalies_detected']['suspicious_patterns'].append({
+                        'scheme_code': scheme,
+                        'scheme_name': scheme_name,
+                        'pattern_type': 'stale_nav',
+                        'max_consecutive_unchanged': max_consecutive,
+                        'description': f'NAV unchanged for {max_consecutive} consecutive days'
+                    })
+            
+            # 4. Data quality checks
+            # Check for missing dates, invalid NAVs, etc.
+            invalid_navs = analysis_df[(analysis_df['nav'] <= 0) | (analysis_df['nav'] > 10000)]
+            
+            for _, row in invalid_navs.iterrows():
+                anomaly_results['anomalies_detected']['data_quality_issues'].append({
+                    'scheme_code': row['scheme_code'],
+                    'scheme_name': row['scheme_name'],
+                    'date': row['date'].strftime('%Y-%m-%d'),
+                    'nav': row['nav'],
+                    'issue_type': 'invalid_nav_value',
+                    'description': f'NAV value {row["nav"]} is outside reasonable range'
+                })
+            
+            # Summary statistics
+            total_anomalies = (
+                len(anomaly_results['anomalies_detected']['extreme_returns']) +
+                len(anomaly_results['anomalies_detected']['nav_jumps']) +
+                len(anomaly_results['anomalies_detected']['suspicious_patterns']) +
+                len(anomaly_results['anomalies_detected']['data_quality_issues'])
+            )
+            
+            anomaly_results['summary_statistics'] = {
+                'total_data_points_analyzed': len(analysis_df),
+                'unique_schemes_analyzed': analysis_df['scheme_code'].nunique(),
+                'analysis_date_range': {
+                    'start': analysis_df['date'].min().strftime('%Y-%m-%d'),
+                    'end': analysis_df['date'].max().strftime('%Y-%m-%d')
+                },
+                'anomaly_counts': {
+                    'extreme_returns': len(anomaly_results['anomalies_detected']['extreme_returns']),
+                    'nav_jumps': len(anomaly_results['anomalies_detected']['nav_jumps']),
+                    'suspicious_patterns': len(anomaly_results['anomalies_detected']['suspicious_patterns']),
+                    'data_quality_issues': len(anomaly_results['anomalies_detected']['data_quality_issues']),
+                    'total_anomalies': total_anomalies
+                },
+                'anomaly_rate': round((total_anomalies / len(analysis_df)) * 100, 3),
+                'data_health_score': max(0, round(100 - (total_anomalies / len(analysis_df)) * 100, 1))
+            }
+            
+            logger.info(f"Anomaly detection completed. Found {total_anomalies} anomalies in {len(analysis_df)} data points")
+            return anomaly_results
+            
+        except Exception as e:
+            logger.error(f"Error detecting anomalies: {e}")
+            return {'status': 'error', 'message': str(e)}
+        
+    def get_correlation_matrix(self, scheme_codes: List[str] = None, period_days: int = 252, 
+                              min_overlap_days: int = 100) -> Dict:
+        """
+        Calculate correlation matrix between schemes' returns.
+        
+        Args:
+            scheme_codes: List of scheme codes to analyze (None for top schemes by data availability)
+            period_days: Number of recent days to analyze
+            min_overlap_days: Minimum overlapping days required between schemes
+            
+        Returns:
+            Dictionary with correlation matrix and analysis
+        """
+        try:
+            logger.info(f"Calculating correlation matrix for schemes over {period_days} days")
+            
+            # Get NAV data
+            nav_data = self.read_from_delta(self.nav_data_path)
+            if nav_data is None or nav_data.isEmpty():
+                return {'status': 'failed', 'reason': 'No NAV data available'}
+            
+            # Get recent data
+            from datetime import timedelta
+            cutoff_date = (datetime.now() - timedelta(days=period_days)).strftime('%Y-%m-%d')
+            recent_data = nav_data.filter(f.col("date") >= cutoff_date)
+            
+            # If no specific schemes provided, select schemes with most data
+            if scheme_codes is None:
+                # Find schemes with most data points in recent period
+                scheme_counts = recent_data.groupBy("scheme_code").agg(
+                    f.count("*").alias("data_points"),
+                    f.first("scheme_name").alias("scheme_name")
+                ).orderBy(col("data_points").desc())
+                
+                # Select top schemes with sufficient data
+                top_schemes = scheme_counts.filter(col("data_points") >= min_overlap_days).limit(10)
+                scheme_codes = [row['scheme_code'] for row in top_schemes.collect()]
+                
+                if not scheme_codes:
+                    return {'status': 'failed', 'reason': f'No schemes found with at least {min_overlap_days} data points'}
+            
+            if len(scheme_codes) < 2:
+                return {'status': 'failed', 'reason': 'Need at least 2 schemes for correlation analysis'}
+            
+            logger.info(f"Analyzing correlation for {len(scheme_codes)} schemes")
+            
+            # Filter data for selected schemes
+            correlation_data = recent_data.filter(f.col("scheme_code").isin(scheme_codes))
+            
+            # Convert to pandas for easier correlation analysis
+            df = correlation_data.select("date", "scheme_code", "nav", "scheme_name").toPandas()
+            
+            if len(df) == 0:
+                return {'status': 'failed', 'reason': 'No data found for specified schemes'}
+            
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values(['scheme_code', 'date'])
+            
+            # Calculate daily returns
+            df['daily_return'] = df.groupby('scheme_code')['nav'].pct_change()
+            df = df.dropna()
+            
+            # Create scheme name mapping
+            scheme_names = df.groupby('scheme_code')['scheme_name'].first().to_dict()
+            
+            # Pivot to create returns matrix
+            returns_matrix = df.pivot(index='date', columns='scheme_code', values='daily_return')
+            
+            # Check data availability
+            data_availability = {}
+            for scheme in scheme_codes:
+                if scheme in returns_matrix.columns:
+                    valid_data = returns_matrix[scheme].dropna()
+                    data_availability[scheme] = {
+                        'total_days': len(valid_data),
+                        'start_date': valid_data.index.min().strftime('%Y-%m-%d'),
+                        'end_date': valid_data.index.max().strftime('%Y-%m-%d'),
+                        'scheme_name': scheme_names.get(scheme, 'Unknown')
+                    }
+                else:
+                    data_availability[scheme] = {
+                        'total_days': 0,
+                        'error': 'No data found'
+                    }
+            
+            # Remove schemes with insufficient data
+            valid_schemes = [s for s in scheme_codes if data_availability[s]['total_days'] >= min_overlap_days]
+            
+            if len(valid_schemes) < 2:
+                return {'status': 'failed', 'reason': f'Only {len(valid_schemes)} schemes have sufficient data'}
+            
+            # Filter returns matrix to valid schemes only
+            returns_clean = returns_matrix[valid_schemes].dropna()
+            
+            if len(returns_clean) < min_overlap_days:
+                return {'status': 'failed', 'reason': f'Insufficient overlapping data: {len(returns_clean)} days'}
+            
+            # Calculate correlation matrix
+            correlation_matrix = returns_clean.corr()
+            
+            # Convert correlation matrix to dictionary format
+            correlation_dict = {}
+            for scheme1 in valid_schemes:
+                correlation_dict[scheme1] = {}
+                for scheme2 in valid_schemes:
+                    correlation_dict[scheme1][scheme2] = round(correlation_matrix.loc[scheme1, scheme2], 4)
+            
+            # Find highly correlated pairs (>0.8) and uncorrelated pairs (<0.3)
+            high_correlations = []
+            low_correlations = []
+            
+            for i, scheme1 in enumerate(valid_schemes):
+                for j, scheme2 in enumerate(valid_schemes):
+                    if i < j:  # Avoid duplicates and self-correlation
+                        corr_value = correlation_matrix.loc[scheme1, scheme2]
+                        
+                        pair_info = {
+                            'scheme1': scheme1,
+                            'scheme1_name': scheme_names.get(scheme1, 'Unknown'),
+                            'scheme2': scheme2,
+                            'scheme2_name': scheme_names.get(scheme2, 'Unknown'),
+                            'correlation': round(corr_value, 4)
+                        }
+                        
+                        if corr_value > 0.8:
+                            high_correlations.append(pair_info)
+                        elif abs(corr_value) < 0.3:
+                            low_correlations.append(pair_info)
+            
+            # Calculate portfolio diversification metrics
+            avg_correlation = correlation_matrix.values[correlation_matrix.values != 1.0].mean()
+            max_correlation = correlation_matrix.values[correlation_matrix.values != 1.0].max()
+            min_correlation = correlation_matrix.values[correlation_matrix.values != 1.0].min()
+            
+            # Diversification score (lower average correlation = better diversification)
+            diversification_score = max(0, round((1 - avg_correlation) * 100, 1))
+            
+            correlation_results = {
+                'analysis_metadata': {
+                    'period_analyzed_days': period_days,
+                    'actual_overlap_days': len(returns_clean),
+                    'schemes_analyzed': len(valid_schemes),
+                    'analysis_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                },
+                'data_availability': data_availability,
+                'correlation_matrix': correlation_dict,
+                'correlation_statistics': {
+                    'average_correlation': round(avg_correlation, 4),
+                    'highest_correlation': round(max_correlation, 4),
+                    'lowest_correlation': round(min_correlation, 4),
+                    'diversification_score': diversification_score
+                },
+                'notable_correlations': {
+                    'highly_correlated_pairs': sorted(high_correlations, key=lambda x: x['correlation'], reverse=True),
+                    'low_correlated_pairs': sorted(low_correlations, key=lambda x: abs(x['correlation']))
+                },
+                'investment_insights': {
+                    'portfolio_diversification': 'Excellent' if diversification_score > 70 else 'Good' if diversification_score > 50 else 'Poor',
+                    'concentration_risk': 'High' if len(high_correlations) > len(valid_schemes) else 'Medium' if len(high_correlations) > 2 else 'Low',
+                    'recommendation': 'Consider reducing highly correlated holdings' if len(high_correlations) > 3 else 'Well diversified portfolio'
+                }
+            }
+            
+            logger.info(f"Correlation analysis completed. Average correlation: {avg_correlation:.4f}, Diversification score: {diversification_score}%")
+            return correlation_results
+            
+        except Exception as e:
+            logger.error(f"Error calculating correlation matrix: {e}")
             return {'status': 'error', 'message': str(e)}
